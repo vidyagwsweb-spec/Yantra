@@ -1,0 +1,198 @@
+name: Build APK
+
+# Drop this file at .github/workflows/build-apk.yml and push.
+#
+# It works in two layouts, so you do not have to unzip anything yourself:
+#   1. The repo contains yantra-android.zip          -> it unpacks and builds it
+#   2. The repo contains the extracted project       -> it builds it directly
+#
+# Either way you get a downloadable app-debug.apk from the Actions tab.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Path to the project zip (leave blank to auto-detect)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.7'
+  COMPILE_SDK: '34'
+
+jobs:
+  build:
+    name: Compile and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- unpack
+      - name: Find the project (unzip if needed)
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          WORK="$ROOT/.build-src"
+          WANTED_ZIP="${{ github.event.inputs.zip_path }}"
+
+          # Case 1: a Gradle project is already checked in.
+          EXISTING="$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts \
+              -not -path "$WORK/*" -not -path "*/build/*" | head -n 1 || true)"
+
+          if [ -n "$EXISTING" ]; then
+            SRC="$(dirname "$EXISTING")"
+            echo "Found an existing Gradle project at: $SRC"
+          else
+            # Case 2: there is a zip to unpack.
+            if [ -n "${WANTED_ZIP:-}" ]; then
+              ZIP="$WANTED_ZIP"
+            else
+              ZIP="$(find "$ROOT" -maxdepth 2 -name '*.zip' -not -path "$WORK/*" | head -n 1 || true)"
+            fi
+
+            if [ -z "${ZIP:-}" ]; then
+              echo "::error::Neither settings.gradle.kts nor a .zip file was found in the repo."
+              echo "Repo contents:"
+              ls -la "$ROOT"
+              exit 1
+            fi
+
+            echo "Unpacking: $ZIP"
+            rm -rf "$WORK"
+            mkdir -p "$WORK"
+            unzip -q -o "$ZIP" -d "$WORK"
+
+            FOUND="$(find "$WORK" -name settings.gradle.kts | head -n 1 || true)"
+            if [ -z "$FOUND" ]; then
+              echo "::error::Unpacked $ZIP but found no settings.gradle.kts inside it."
+              find "$WORK" -maxdepth 3 | head -50
+              exit 1
+            fi
+            SRC="$(dirname "$FOUND")"
+            echo "Unpacked Gradle project to: $SRC"
+          fi
+
+          echo "path=$SRC" >> "$GITHUB_OUTPUT"
+          echo "--- project root ---"
+          ls -la "$SRC"
+
+      # ------------------------------------------------------------- toolchain
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Make sure the Android SDK has what we compile against
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "Android SDK at $SDK"
+          export ANDROID_HOME="$SDK"
+          export ANDROID_SDK_ROOT="$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK" -name sdkmanager -type f | head -n 1 || true)"
+          fi
+
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" "platforms;android-${{ env.COMPILE_SDK }}" "build-tools;34.0.0" \
+              "platform-tools" >/dev/null 2>&1 || echo "::warning::sdkmanager could not add packages; using what the image already has."
+          else
+            echo "::warning::sdkmanager not found; relying on the preinstalled SDK."
+          fi
+
+      - name: Versions
+        shell: bash
+        run: |
+          java -version
+          gradle --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
+      # ---------------------------------------------------------------- build
+      - name: Unit tests
+        working-directory: ${{ steps.src.outputs.path }}
+        run: gradle test --no-daemon --stacktrace --console=plain
+
+      - name: Assemble debug APK
+        working-directory: ${{ steps.src.outputs.path }}
+        run: gradle assembleDebug --no-daemon --stacktrace --console=plain
+
+      - name: Collect the APK
+        id: apk
+        shell: bash
+        working-directory: ${{ steps.src.outputs.path }}
+        run: |
+          set -euo pipefail
+          APK="$(find . -path '*/outputs/apk/debug/*.apk' | head -n 1 || true)"
+          if [ -z "$APK" ]; then
+            echo "::error::Gradle succeeded but no debug APK was produced."
+            find . -name '*.apk' | head
+            exit 1
+          fi
+          NAME="yantra-$(date +%Y%m%d)-$(git rev-parse --short HEAD 2>/dev/null || echo local).apk"
+          cp "$APK" "$GITHUB_WORKSPACE/$NAME"
+          echo "file=$NAME" >> "$GITHUB_OUTPUT"
+          ls -lh "$GITHUB_WORKSPACE/$NAME"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: yantra-debug-apk
+          path: ${{ github.workspace }}/${{ steps.apk.outputs.file }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # ------------------------------------------------------- on failure help
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            ${{ steps.src.outputs.path }}/app/build/reports/**
+            ${{ steps.src.outputs.path }}/app/build/outputs/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Attach APK to a release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the APK
+        uses: actions/download-artifact@v4
+        with:
+          name: yantra-debug-apk
+          path: apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apk/*.apk
+          generate_release_notes: true
